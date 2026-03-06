@@ -33,7 +33,7 @@ func setup() {
 
 	kafkaContainer, err := kafka.RunContainer(ctx,
 		kafka.WithClusterID("test-cluster"),
-		testcontainers.WithImage("confluentinc/confluent-local:7.5.3"),
+		testcontainers.WithImage("confluentinc/confluent-local:8.1.1"),
 	)
 	if err != nil {
 		panic(err)

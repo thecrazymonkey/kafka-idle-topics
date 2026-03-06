@@ -1,14 +1,14 @@
 language: go
 
 go:
-  - 1.20.x
-  - 1.21.x
+  - 1.22.x
+  - 1.23.x
 
 services:
   - docker
 
 script:
-  - docker pull confluentinc/confluent-local:7.5.3
+  - docker pull confluentinc/confluent-local:8.1.1
   - go build -o kafka-idle-topics ./cmd/kafka-idle-topics/*
   - cd cmd/kafka-idle-topics/
   - go test
