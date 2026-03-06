@@ -74,6 +74,38 @@ func (c *KafkaIdleTopics) markDeleteCandidate(topic string) {
 	}
 }
 
+// markDeleteCandidateIfIdle marks a topic as a deletion candidate only if all
+// of its partitions have been tracked as idle in the persistent state for at
+// least c.idleMinutes. If any partition lacks a state record, one is created
+// with the current time so the idle clock starts ticking.
+func (c *KafkaIdleTopics) markDeleteCandidateIfIdle(topic string, state *PersistentState, now time.Time) {
+	idleThreshold := time.Duration(c.idleMinutes) * time.Minute
+	partitions := c.topicPartitionMap[topic]
+	allIdleLongEnough := true
+
+	for _, partition := range partitions {
+		key := fmt.Sprintf("%s:%d", topic, partition)
+		record, exists := state.Records[key]
+		if !exists {
+			state.Records[key] = IdleRecord{
+				FirstSeenIdleAt: now,
+				LastKnownOffset: -1,
+			}
+			if c.idleMinutes > 0 {
+				allIdleLongEnough = false
+			}
+			continue
+		}
+		if now.Sub(record.FirstSeenIdleAt) < idleThreshold {
+			allIdleLongEnough = false
+		}
+	}
+
+	if allIdleLongEnough {
+		c.markDeleteCandidate(topic)
+	}
+}
+
 /*
 Assesses production activity for all topics by comparing current offsets to previously recorded offsets.
 Updates the persistent state and marks topics as deletion candidates if they have been idle
@@ -148,9 +180,11 @@ func (c *KafkaIdleTopics) assessProductionActivity(
 Adds topics with nothing stored in them to c.DeleteCandidates
 It is also possible for this method to remove candidacy if it detects activity.
 */
-func (c *KafkaIdleTopics) filterEmptyTopics(clusterClient sarama.Client) {
+func (c *KafkaIdleTopics) filterEmptyTopics(clusterClient sarama.Client, state *PersistentState) {
 	defer clusterClient.Close()
 	log.Println("Evaluating Topics without anything in them...")
+
+	now := time.Now()
 
 	for topic, td := range c.topicPartitionMap {
 		thisTopicsPartitions := td
@@ -167,7 +201,7 @@ func (c *KafkaIdleTopics) filterEmptyTopics(clusterClient sarama.Client) {
 				c.DeleteCandidates[topic] = false
 				break
 			} else {
-				c.markDeleteCandidate(topic)
+				c.markDeleteCandidateIfIdle(topic, state, now)
 			}
 		}
 	}
@@ -181,10 +215,13 @@ This check applies regardless of whether the consumer group is currently running
 func (c *KafkaIdleTopics) filterTopicsWithConsumerGroups(
 	adminClient sarama.ClusterAdmin,
 	clusterClient sarama.Client,
+	state *PersistentState,
 ) {
 	defer adminClient.Close()
 	defer clusterClient.Close()
 	log.Println("Evaluating Topics with consumer group activity...")
+
+	now := time.Now()
 
 	allConsumerGroups, err := adminClient.ListConsumerGroups()
 	if err != nil {
@@ -192,7 +229,7 @@ func (c *KafkaIdleTopics) filterTopicsWithConsumerGroups(
 	}
 
 	// Calculate the idle boundary timestamp (in milliseconds)
-	idleBoundaryTs := time.Now().Add(-time.Duration(c.idleMinutes) * time.Minute).UnixMilli()
+	idleBoundaryTs := now.Add(-time.Duration(c.idleMinutes) * time.Minute).UnixMilli()
 
 	// Pre-fetch boundary offsets once per partition to avoid redundant Kafka API
 	// calls inside the per-consumer-group loop below.
@@ -225,7 +262,7 @@ func (c *KafkaIdleTopics) filterTopicsWithConsumerGroups(
 
 				// Group has never committed on this partition - no protection
 				if committedOffset == -1 {
-					c.markDeleteCandidate(topic)
+					c.markDeleteCandidateIfIdle(topic, state, now)
 					continue
 				}
 
@@ -238,7 +275,7 @@ func (c *KafkaIdleTopics) filterTopicsWithConsumerGroups(
 				// idleBoundaryOffset == -1 means no messages at or after the boundary exist
 				// All retained data predates the idle window - committed offset is stale
 				if idleBoundaryOffset == -1 {
-					c.markDeleteCandidate(topic)
+					c.markDeleteCandidateIfIdle(topic, state, now)
 					continue
 				}
 
@@ -249,7 +286,7 @@ func (c *KafkaIdleTopics) filterTopicsWithConsumerGroups(
 					break // One active group is enough to protect the topic
 				} else {
 					// Committed offset is stale (predates the idle window)
-					c.markDeleteCandidate(topic)
+					c.markDeleteCandidateIfIdle(topic, state, now)
 				}
 			}
 		}

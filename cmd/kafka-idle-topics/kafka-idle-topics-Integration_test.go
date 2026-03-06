@@ -143,7 +143,16 @@ func TestFilterNoStorageTopics(t *testing.T) {
 	instanceOfChecker.topicPartitionMap = map[string][]int32{topicA: {0}, topicB: {0}}
 	expectedTopicResult := map[string]bool{topicB: true}
 
-	instanceOfChecker.filterEmptyTopics(clusterClient)
+	// Use state with pre-existing idle records so the idle threshold is already met
+	state := PersistentState{
+		SchemaVersion: 1,
+		Records: map[string]IdleRecord{
+			topicA + ":0": {FirstSeenIdleAt: time.Now().Add(-2 * time.Hour), LastKnownOffset: 0},
+			topicB + ":0": {FirstSeenIdleAt: time.Now().Add(-2 * time.Hour), LastKnownOffset: 0},
+		},
+	}
+
+	instanceOfChecker.filterEmptyTopics(clusterClient, &state)
 	instanceOfChecker.filterOutDeleteCandidates()
 
 	assert.Equal(t, expectedTopicResult, instanceOfChecker.DeleteCandidates)
@@ -220,9 +229,19 @@ func TestFilterActiveConsumerGroupTopics(t *testing.T) {
 	instanceOfChecker.topicPartitionMap = map[string][]int32{topicA: {0}, topicB: {0}}
 	expectedTopicResult := map[string]bool{topicB: true}
 
+	// Use state with pre-existing idle records so the idle threshold is already met
+	state := PersistentState{
+		SchemaVersion: 1,
+		Records: map[string]IdleRecord{
+			topicA + ":0": {FirstSeenIdleAt: time.Now().Add(-2 * time.Hour), LastKnownOffset: 0},
+			topicB + ":0": {FirstSeenIdleAt: time.Now().Add(-2 * time.Hour), LastKnownOffset: 0},
+		},
+	}
+
 	instanceOfChecker.filterTopicsWithConsumerGroups(
 		instanceOfChecker.getAdminClient("none"),
 		instanceOfChecker.getClusterClient("none"),
+		&state,
 	)
 	instanceOfChecker.filterOutDeleteCandidates()
 
@@ -253,9 +272,18 @@ func TestCandidacyRemoval(t *testing.T) {
 	instanceOfChecker.topicPartitionMap = map[string][]int32{topicA: {0}, topicB: {0}}
 	expectedTopicResult := map[string]bool{}
 
+	// Use state with pre-existing idle records so the idle threshold is already met
+	state := PersistentState{
+		SchemaVersion: 1,
+		Records: map[string]IdleRecord{
+			topicA + ":0": {FirstSeenIdleAt: time.Now().Add(-2 * time.Hour), LastKnownOffset: 0},
+			topicB + ":0": {FirstSeenIdleAt: time.Now().Add(-2 * time.Hour), LastKnownOffset: 0},
+		},
+	}
+
 	// topicA is no longer empty, which means it is not a delete candidate
 	clusterClient := instanceOfChecker.getClusterClient("none")
-	instanceOfChecker.filterEmptyTopics(clusterClient)
+	instanceOfChecker.filterEmptyTopics(clusterClient, &state)
 
 	// At this point, topicB is a candidate, but we'll remove candidacy due to active consumer groups
 	go produceTopicHelper(topicB)
@@ -265,6 +293,7 @@ func TestCandidacyRemoval(t *testing.T) {
 	instanceOfChecker.filterTopicsWithConsumerGroups(
 		instanceOfChecker.getAdminClient("none"),
 		instanceOfChecker.getClusterClient("none"),
+		&state,
 	)
 
 	StopProduction = true

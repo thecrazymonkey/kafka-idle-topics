@@ -107,11 +107,12 @@ func main() {
 		myChecker.filterTopicsWithConsumerGroups(
 			myChecker.getAdminClient(myChecker.kafkaSecurity),
 			myChecker.getClusterClient(myChecker.kafkaSecurity),
+			&state,
 		)
 	}
 
 	if !isInSlice("storage", stepsToSkip) {
-		myChecker.filterEmptyTopics(myChecker.getClusterClient(myChecker.kafkaSecurity))
+		myChecker.filterEmptyTopics(myChecker.getClusterClient(myChecker.kafkaSecurity), &state)
 	}
 
 	myChecker.filterOutDeleteCandidates()
