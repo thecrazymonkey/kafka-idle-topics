@@ -2,3 +2,4 @@
 idleTopics.txt
 kafka-idle-topics
 .vscode/settings.json
+idle-state.json
