@@ -1,6 +1,6 @@
 module github.com/abraham-leal/kafka-idle-topics
 
-go 1.21
+go 1.24
 
 require (
 	github.com/IBM/sarama v1.42.1

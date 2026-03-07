@@ -129,5 +129,5 @@ func main() {
 		partitionCount = partitionCount + len(ps)
 	}
 
-	log.Printf("Done! You can delete %v topics and %v partitions! A list of found idle topics is available at: %s", len(myChecker.topicPartitionMap), partitionCount, path)
+	log.Printf("Done! You can delete %v topics with %v partitions! A list of found idle topics is available at: %s", len(myChecker.topicPartitionMap), partitionCount, path)
 }
