@@ -1,7 +1,5 @@
 = kafka-idle-topics
 
-image:https://travis-ci.com/abraham-leal/kafka-idle-topics.svg?branch=main["Build Status", link="https://travis-ci.com/abraham-leal/kafka-idle-topics"]
-
 Tooling to find topics that are not utilized in your Kafka cluster.
 
 Ensure efficient usage of your topics in https://www.confluent.io/confluent-cloud/[Confluent Cloud] by discovering topics that aren't being used.
@@ -9,8 +7,10 @@ Ensure efficient usage of your topics in https://www.confluent.io/confluent-clou
 `kafka-idle-topics` evaluates an idle topic through these criteria:
 
 - It has no Consumer Groups (including inactive consumer groups that have offsets committed).
-- It has no active production during the time of assessment (30 seconds while running by default).
+- It has no active production during a configurable idle window (default 60 minutes, set via `-idleMinutes`).
 - It has no data within its partitions.
+
+Idle detection state is persisted to a JSON file (`idle-state.json` by default) so that the idle window survives restarts.
 
 To download, go to `Run` for different ways of usage. It is also possible to download a release.
 The output will be written to a file in the same directory. The name of this file is configurable.
@@ -33,15 +33,15 @@ Usage of ./kafka-idle-topics:
   -hideTopicsPrefixes value
     	Disqualify provided prefixes from assessment. A comma delimited list. It also accepts a path to a file containing a list.
   -idleMinutes int
-    	Amount of minutes a topic should be idle to report it. Can be set using env variable KAFKA_IDLE_MINUTES
+    	Minutes of inactivity before a topic is a deletion candidate. Governs both production and consumption checks uniformly. Can be set using env variable KAFKA_IDLE_MINUTES (default 60)
   -kafkaSecurity string
     	Type of connection to attempt. Options: plain_tls, plain (no tls), tls (one-way), none. (default "none")
   -password string
     	Password in the PLAIN module. Can be set using env variable KAFKA_PASSWORD
-  -productionAssessmentTimeMs int
-    	Timeframe to assess active production. (default 30000)
   -skip string
     	Filtering to skip. Options are: production, consumption, storage. This can be a comma-delimited list.
+  -stateFile string
+    	Path to the persistent idle-state file. Mount a persistent volume at this path in containerised deployments. (default "idle-state.json")
   -username string
     	Username in the PLAIN module. Can be set using env variable KAFKA_USERNAME
   -version
@@ -74,7 +74,7 @@ docker run \
   -e KAFKA_BOOTSTRAP=<<BOOTSTRAP-SERVERS>>\
   -e KAFKA_USERNAME=<<API-KEY>>\
   -e KAFKA_PASSWORD=<<API-SECRET>>\
-  abrahamleal/kafka-idle-topics:latest 
+  thecrazymonkey/kafka-idle-topics:latest
 ----
 
 === Locally
@@ -83,8 +83,8 @@ Downloading with Go, example with Confluent Cloud:
 
 [source,bash]
 ----
-go get github.com/abraham-leal/kafka-idle-topics/cmd/kafka-idle-topics
-go install github.com/abraham-leal/kafka-idle-topics/cmd/kafka-idle-topics
+go get github.com/thecrazymonkey/kafka-idle-topics/cmd/kafka-idle-topics
+go install github.com/thecrazymonkey/kafka-idle-topics/cmd/kafka-idle-topics
 $GOPATH/bin/kafka-idle-topics -bootstrap-servers <<bootstrap>> -username <<API-KEY>> -password <<API-SECRET>> -kafkaSecurity plain_tls
 ----
 
@@ -94,7 +94,7 @@ Git clone, example with Confluent Cloud:
 
 [source,bash]
 ----
-git clone https://github.com/abraham-leal/kafka-idle-topics
+git clone https://github.com/thecrazymonkey/kafka-idle-topics
 cd kafka-idle-topics/
 go build ./cmd/kafka-idle-topics/*
 ./kafka-idle-topics -bootstrap-servers <<bootstrap>> -username <<API-KEY>> -password <<API-SECRET>> -kafkaSecurity plain_tls

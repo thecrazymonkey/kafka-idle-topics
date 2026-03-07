@@ -1,4 +1,4 @@
-FROM golang:1.24 AS builder
+FROM golang:1.26 AS builder
 COPY . /app
 WORKDIR /app
 RUN CGO_ENABLED=0 GOOS=linux go build -o kafka-idle-topics ./cmd/kafka-idle-topics/*
