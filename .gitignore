@@ -1,5 +1,5 @@
 .idea/
 idleTopics.txt
-kafka-idle-topics
+/kafka-idle-topics
 .vscode/settings.json
 idle-state.json
