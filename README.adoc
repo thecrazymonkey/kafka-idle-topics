@@ -52,10 +52,10 @@ Usage of ./kafka-idle-topics:
 
 `kafka-idle-topics` supports the following security set-ups:
 
-- `plain_tls`: SASL_SSL w/ PLAIN  
+- `plain_tls`: SASL_SSL w/ PLAIN
 - `plain`: SASL_PLAINTEXT w/ PLAIN (No TLS)
 - `tls`: SSL (One-way TLS)
-- `none`: PLAINTEXT (Default)  
+- `none`: PLAINTEXT (Default)
 
 To add certificates the tool can trust for TLS connections, ensure they are located in the subdirectories go seeks.
 Commonly it is `/etc/ssl/certs/`.
@@ -76,6 +76,22 @@ docker run \
   -e KAFKA_PASSWORD=<<API-SECRET>>\
   thecrazymonkey/kafka-idle-topics:latest
 ----
+
+To persist the idle detection state across container restarts, mount a local directory and set the `-stateFile` flag:
+
+[source,bash]
+----
+docker run \
+  -e KAFKA_BOOTSTRAP=<<BOOTSTRAP-SERVERS>>\
+  -e KAFKA_USERNAME=<<API-KEY>>\
+  -e KAFKA_PASSWORD=<<API-SECRET>>\
+  -v /path/to/local/storage:/data \
+  thecrazymonkey/kafka-idle-topics:latest \
+  -kafkaSecurity plain_tls \
+  -stateFile /data/idle-state.json
+----
+
+NOTE: Without a mounted volume, the idle state is lost when the container stops, and the idle timer resets on every run.
 
 === Locally
 
@@ -117,4 +133,3 @@ If you'd like to see something fixed that was not caught by testing, or you'd li
 to file a Github issue in this repo, I'll review and answer at best effort.
 
 Additionally, if you'd like to contribute a fix/feature, please feel free to open a PR for review.
-
