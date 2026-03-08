@@ -2,31 +2,29 @@ package main
 
 import (
 	"fmt"
-	"github.com/IBM/sarama"
 	"log"
 	"os"
-	"reflect"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/IBM/sarama"
 )
 
 type KafkaIdleTopics struct {
-	kafkaUrl                 string
-	kafkaUsername            string
-	kafkaPassword            string
-	kafkaSecurity            string
-	fileName                 string
-	skip                     string
-	productionAssessmentTime int
-	hideInternalTopics       bool
-	AllowList                StringArrayFlag
-	DisallowList             StringArrayFlag
-	hideDerivativeTopics     StringArrayFlag
-	topicsIdleMinutes        int64
-	waitForTopicEvaluation   sync.WaitGroup
-	topicPartitionMap        map[string][]int32
-	DeleteCandidates         map[string]bool
+	kafkaUrl             string
+	kafkaUsername        string
+	kafkaPassword        string
+	kafkaSecurity        string
+	fileName             string
+	stateFile            string // path for the persistent state file
+	skip                 string
+	hideInternalTopics   bool
+	AllowList            StringArrayFlag
+	DisallowList         StringArrayFlag
+	hideDerivativeTopics StringArrayFlag
+	idleMinutes          int64 // unified threshold for production and consumption checks
+	topicPartitionMap    map[string][]int32
+	DeleteCandidates     map[string]bool
 }
 
 /*
@@ -68,13 +66,125 @@ func (c *KafkaIdleTopics) getClusterTopics(adminClient sarama.ClusterAdmin) map[
 	return c.topicPartitionMap
 }
 
+// markDeleteCandidate marks topic as a deletion candidate unless it is already
+// protected (DeleteCandidates[topic] == false).
+func (c *KafkaIdleTopics) markDeleteCandidate(topic string) {
+	if v, exists := c.DeleteCandidates[topic]; !exists || v {
+		c.DeleteCandidates[topic] = true
+	}
+}
+
+// markDeleteCandidateIfIdle marks a topic as a deletion candidate only if all
+// of its partitions have been tracked as idle in the persistent state for at
+// least c.idleMinutes. If any partition lacks a state record, one is created
+// with the current time so the idle clock starts ticking.
+func (c *KafkaIdleTopics) markDeleteCandidateIfIdle(topic string, state *PersistentState, now time.Time) {
+	idleThreshold := time.Duration(c.idleMinutes) * time.Minute
+	partitions := c.topicPartitionMap[topic]
+	allIdleLongEnough := true
+
+	for _, partition := range partitions {
+		key := fmt.Sprintf("%s:%d", topic, partition)
+		record, exists := state.Records[key]
+		if !exists {
+			state.Records[key] = IdleRecord{
+				FirstSeenIdleAt: now,
+				LastKnownOffset: -1,
+			}
+			if c.idleMinutes > 0 {
+				allIdleLongEnough = false
+			}
+			continue
+		}
+		if now.Sub(record.FirstSeenIdleAt) < idleThreshold {
+			allIdleLongEnough = false
+		}
+	}
+
+	if allIdleLongEnough {
+		c.markDeleteCandidate(topic)
+	}
+}
+
+/*
+Assesses production activity for all topics by comparing current offsets to previously recorded offsets.
+Updates the persistent state and marks topics as deletion candidates if they have been idle
+for longer than c.idleMinutes.
+*/
+func (c *KafkaIdleTopics) assessProductionActivity(
+	clusterClient sarama.Client,
+	state *PersistentState,
+) error {
+	defer clusterClient.Close()
+	log.Println("Evaluating production activity across all topics...")
+
+	now := time.Now()
+	idleThreshold := time.Duration(c.idleMinutes) * time.Minute
+
+	for topic, partitions := range c.topicPartitionMap {
+		topicHasActivity := false
+
+		for _, partition := range partitions {
+			// Get current offset for this partition
+			currentOffset, err := clusterClient.GetOffset(topic, partition, sarama.OffsetNewest)
+			if err != nil {
+				log.Printf("WARN: Could not determine offset for %s:%d: %v", topic, partition, err)
+				continue
+			}
+
+			key := fmt.Sprintf("%s:%d", topic, partition)
+			record, exists := state.Records[key]
+
+			if !exists {
+				// First time seeing this partition - create a record
+				state.Records[key] = IdleRecord{
+					FirstSeenIdleAt: now,
+					LastKnownOffset: currentOffset,
+				}
+				// With idleMinutes=0 the threshold is already met on first sighting
+				if c.idleMinutes == 0 {
+					c.markDeleteCandidate(topic)
+				}
+				continue
+			}
+
+			if currentOffset > record.LastKnownOffset {
+				// Partition is actively receiving messages - reset idle tracking
+				delete(state.Records, key)
+				topicHasActivity = true
+			} else {
+				// Offset unchanged - check if idle threshold exceeded
+				idleDuration := now.Sub(record.FirstSeenIdleAt)
+				if idleDuration >= idleThreshold {
+					// Topic has been idle long enough - mark as candidate
+					c.markDeleteCandidate(topic)
+				}
+				// Update the record with current offset (in case it matters for future runs)
+				state.Records[key] = IdleRecord{
+					FirstSeenIdleAt: record.FirstSeenIdleAt,
+					LastKnownOffset: currentOffset,
+				}
+			}
+		}
+
+		// If any partition showed activity, mark the topic as not a candidate
+		if topicHasActivity {
+			c.DeleteCandidates[topic] = false
+		}
+	}
+
+	return nil
+}
+
 /*
 Adds topics with nothing stored in them to c.DeleteCandidates
 It is also possible for this method to remove candidacy if it detects activity.
 */
-func (c *KafkaIdleTopics) filterEmptyTopics(clusterClient sarama.Client) {
+func (c *KafkaIdleTopics) filterEmptyTopics(clusterClient sarama.Client, state *PersistentState) {
 	defer clusterClient.Close()
 	log.Println("Evaluating Topics without anything in them...")
+
+	now := time.Now()
 
 	for topic, td := range c.topicPartitionMap {
 		thisTopicsPartitions := td
@@ -91,173 +201,95 @@ func (c *KafkaIdleTopics) filterEmptyTopics(clusterClient sarama.Client) {
 				c.DeleteCandidates[topic] = false
 				break
 			} else {
-				v, e := c.DeleteCandidates[topic]
-				if !e {
-					c.DeleteCandidates[topic] = true
-				} else if e && v != false {
-					c.DeleteCandidates[topic] = true
-				}
+				c.markDeleteCandidateIfIdle(topic, state, now)
 			}
 		}
 	}
 }
 
 /*
-Adds topics that aren't being actively produced to c.DeleteCandidates
-It is also possible for this method to remove candidacy if it detects activity.
+Evaluates consumer group staleness and removes topics from deletion candidates
+if any consumer group has committed an offset within the idle window.
+This check applies regardless of whether the consumer group is currently running.
 */
-func (c *KafkaIdleTopics) filterActiveProductionTopics(clusterClient sarama.Client) {
-	defer clusterClient.Close()
-	log.Println("Evaluating Topics without any active production...")
-
-	beginTopicInspection := map[string]map[int64]int64{}
-
-	for t := range c.topicPartitionMap {
-		thisTopicCounts := map[int64]int64{}
-		for _, partition := range c.topicPartitionMap[t] {
-			newestOffsetForPartition, err := clusterClient.GetOffset(t, partition, sarama.OffsetNewest)
-			if err != nil {
-				log.Fatalf("Could not determine topic end offset: %v", err)
-			}
-			thisTopicCounts[int64(partition)] = newestOffsetForPartition
-		}
-		beginTopicInspection[t] = thisTopicCounts
-	}
-
-	// Sleep for configurable time to see if the offsets grow
-	log.Printf("Waiting for %v ms to evaluate active production.", c.productionAssessmentTime)
-	time.Sleep(time.Duration(c.productionAssessmentTime) * time.Millisecond)
-
-	endTopicInspection := map[string]map[int64]int64{}
-
-	for t := range c.topicPartitionMap {
-		thisTopicCounts := map[int64]int64{}
-		for _, partition := range c.topicPartitionMap[t] {
-			newestOffsetForPartition, err := clusterClient.GetOffset(t, partition, sarama.OffsetNewest)
-			if err != nil {
-				log.Fatalf("Could not determine topic end offset: %v", err)
-			}
-			thisTopicCounts[int64(partition)] = newestOffsetForPartition
-		}
-		endTopicInspection[t] = thisTopicCounts
-	}
-
-	for topic, partitionOffset := range endTopicInspection {
-		if !reflect.DeepEqual(beginTopicInspection[topic], partitionOffset) {
-			c.DeleteCandidates[topic] = false
-		} else {
-			v, e := c.DeleteCandidates[topic]
-			if !e {
-				c.DeleteCandidates[topic] = true
-			} else if e && v != false {
-				c.DeleteCandidates[topic] = true
-			}
-		}
-	}
-}
-
-/*
-Adds topics that do not have any consumer groups to c.DeleteCandidates
-It is also possible for this method to remove candidacy if it detects activity.
-*/
-func (c *KafkaIdleTopics) filterTopicsWithConsumerGroups(adminClient sarama.ClusterAdmin) {
+func (c *KafkaIdleTopics) filterTopicsWithConsumerGroups(
+	adminClient sarama.ClusterAdmin,
+	clusterClient sarama.Client,
+	state *PersistentState,
+) {
 	defer adminClient.Close()
-	log.Println("Evaluating Topics without active Consumer Groups...")
+	defer clusterClient.Close()
+	log.Println("Evaluating Topics with consumer group activity...")
+
+	now := time.Now()
+
 	allConsumerGroups, err := adminClient.ListConsumerGroups()
 	if err != nil {
 		log.Fatalf("Could not obtain Consumer Groups from cluster: %v", err)
 	}
 
+	// Calculate the idle boundary timestamp (in milliseconds)
+	idleBoundaryTs := now.Add(-time.Duration(c.idleMinutes) * time.Minute).UnixMilli()
+
+	// Pre-fetch boundary offsets once per partition to avoid redundant Kafka API
+	// calls inside the per-consumer-group loop below.
+	boundaryOffsets := make(map[string]int64)
+	for topic, partitions := range c.topicPartitionMap {
+		for _, partition := range partitions {
+			offset, err := clusterClient.GetOffset(topic, partition, idleBoundaryTs)
+			if err != nil {
+				log.Printf("WARN: Could not get offset for timestamp on %s:%d: %v", topic, partition, err)
+				continue
+			}
+			boundaryOffsets[fmt.Sprintf("%s:%d", topic, partition)] = offset
+		}
+	}
+
 	for cg := range allConsumerGroups {
 		result, err := adminClient.ListConsumerGroupOffsets(cg, c.topicPartitionMap)
 		if err != nil {
-			log.Fatalf("Cannot determine if topic is in use by consumers.")
+			log.Printf("WARN: Cannot determine offsets for consumer group %s: %v", cg, err)
+			continue
 		}
 
 		for topic, partitionData := range result.Blocks {
-			for _, dataset := range partitionData {
-				if dataset.Offset != -1 {
+			// Skip topics already confirmed as in-use by a previous group
+			if v, exists := c.DeleteCandidates[topic]; exists && !v {
+				continue
+			}
+			for partition, dataset := range partitionData {
+				committedOffset := dataset.Offset
+
+				// Group has never committed on this partition - no protection
+				if committedOffset == -1 {
+					c.markDeleteCandidateIfIdle(topic, state, now)
+					continue
+				}
+
+				idleBoundaryOffset, ok := boundaryOffsets[fmt.Sprintf("%s:%d", topic, partition)]
+				if !ok {
+					// Error already logged during pre-fetch; skip this partition
+					continue
+				}
+
+				// idleBoundaryOffset == -1 means no messages at or after the boundary exist
+				// All retained data predates the idle window - committed offset is stale
+				if idleBoundaryOffset == -1 {
+					c.markDeleteCandidateIfIdle(topic, state, now)
+					continue
+				}
+
+				// If committed offset >= idleBoundaryOffset, the group consumed within the window
+				// Topic is in active use - protect it regardless of group's current running state
+				if committedOffset >= idleBoundaryOffset {
 					c.DeleteCandidates[topic] = false
-					break
+					break // One active group is enough to protect the topic
 				} else {
-					v, e := c.DeleteCandidates[topic]
-					if !e {
-						c.DeleteCandidates[topic] = true
-					} else if e && v != false {
-						c.DeleteCandidates[topic] = true
-					}
+					// Committed offset is stale (predates the idle window)
+					c.markDeleteCandidateIfIdle(topic, state, now)
 				}
 			}
 		}
-	}
-}
-
-/*
-Adds topics that have not been produced to since a c.timeMinutesSince to c.DeleteCandidates
-It is also possible for this method to remove candidacy if it detects activity.
-*/
-func (c *KafkaIdleTopics) filterTopicsIdleSince(clusterClient sarama.Client) {
-	defer clusterClient.Close()
-	log.Printf("Evaluating Topics that haven't been produced to since... %v", time.Now().Add(-time.Duration(c.topicsIdleMinutes)*time.Minute))
-
-	evaluatingConsumer, err := sarama.NewConsumerFromClient(clusterClient)
-	if err != nil {
-		log.Fatalln("Could not consume from cluster to evaluate")
-	}
-	defer evaluatingConsumer.Close()
-
-	for topic, td := range c.topicPartitionMap {
-		thisTopicsPartitions := td
-		thisTopicConsumers := []sarama.PartitionConsumer{}
-
-		for _, partition := range thisTopicsPartitions {
-			pcons, err := evaluatingConsumer.ConsumePartition(topic, partition, sarama.OffsetNewest-1)
-			if err != nil {
-				log.Fatalf("Could not consume from topic: %v", err)
-			}
-			thisTopicConsumers = append(thisTopicConsumers, pcons)
-		}
-		c.waitForTopicEvaluation.Add(1)
-		go c.evaluateTopicTimes(thisTopicConsumers, topic, &c.waitForTopicEvaluation)
-	}
-
-	c.waitForTopicEvaluation.Wait()
-}
-
-/*
-Helper method to filterTopicsIdleSince
-*/
-func (c *KafkaIdleTopics) evaluateTopicTimes(pcons []sarama.PartitionConsumer, topic string, group *sync.WaitGroup) {
-	defer group.Done()
-	partitionHasSomething := []bool{}
-
-	for _, pcon := range pcons {
-		select {
-		case msg := <-pcon.Messages():
-			if msg.Timestamp.Before(time.Now().Add(-time.Duration(c.topicsIdleMinutes) * time.Minute)) { // If last produced message has timestamp before deadline
-				partitionHasSomething = append(partitionHasSomething, false) // Add topic as candidate
-			} else {
-				partitionHasSomething = append(partitionHasSomething, true) // Else: Remove
-			}
-			break
-		case <-time.After(time.Duration(5) * time.Second):
-			partitionHasSomething = append(partitionHasSomething, false) // If times out, add as candidate
-		}
-		pcon.AsyncClose()
-	}
-
-	for _, value := range partitionHasSomething {
-		if value == true {
-			c.DeleteCandidates[topic] = false
-			return
-		}
-	}
-
-	v, e := c.DeleteCandidates[topic]
-	if !e {
-		c.DeleteCandidates[topic] = true
-	} else if e && v != false {
-		c.DeleteCandidates[topic] = true
 	}
 }
 
